@@ -761,7 +761,7 @@ class LLAMA_MOE_TP {
     }
 #endif
 
-    int m_block = QK_K;
+    int m_block = config_.intermediate_size % QK_K == 0 ? QK_K : config_.m_block;
     int nth = config_.intermediate_size / m_block;
     // printf("nth: %d, m_block: %d, activated_expert: %d\n", nth, m_block, activated_expert);
     // printf("config_.hidden_size: %d, config_.intermediate_size: %d\n", config_.hidden_size,
