@@ -260,6 +260,15 @@ bool llamafile_sgemm_impl(long m, long n, long k, const void* A, long lda, const
         case GGML_TYPE_IQ4_NL: {
             if (Btype != GGML_TYPE_Q8_0)
                 return NOT_SUPPORTED;
+#if defined(__AVX2__)
+            // 多 token 复用分块解码；原点积每次读两个量化块，奇数块也走分块内核。
+            if (n > 1 || k % 2 != 0) {
+                tinyBLAS_Q0_AVX2<0, block_iq4_nl, block_q8_0, TC> tb{
+                    k, (const block_iq4_nl*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth};
+                tb.matmul(m, n, task);
+                return true;
+            }
+#endif
             if (task != GGML_TASK_TYPE_COMPUTE)
                 return true;
 

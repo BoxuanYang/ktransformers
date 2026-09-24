@@ -1029,6 +1029,16 @@ class tinyBLAS_Q0_AVX2 {
                                _mm256_set1_epi8(8));
     }
 
+    inline __m256i load(const block_iq4_nl* b) {
+        const __m128i values = _mm_setr_epi8(-127, -104, -83, -65, -49, -35, -22, -10,
+                                           1, 13, 25, 38, 53, 69, 89, 113);
+        const __m128i packed = _mm_loadu_si128((const __m128i*)b->qs);
+        const __m128i mask = _mm_set1_epi8(15);
+        const __m128i lo = _mm_shuffle_epi8(values, _mm_and_si128(packed, mask));
+        const __m128i hi = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(packed, 4), mask));
+        return _mm256_insertf128_si256(_mm256_castsi128_si256(lo), hi, 1);
+    }
+
     inline __m256 updot(__m256i u, __m256i s) {
         __m256i res;
 #if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))

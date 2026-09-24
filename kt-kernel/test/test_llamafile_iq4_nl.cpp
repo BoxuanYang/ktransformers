@@ -1,6 +1,9 @@
 // 独立 CPU 数值回归：直接编译实际 Llamafile 内核，不需要 GPU 或模型权重。
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <vector>
@@ -15,10 +18,10 @@ int test_matmul() {
   for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
     const auto traits = ggml_internal_get_type_traits(type);
     const auto input_traits = ggml_internal_get_type_traits(traits.vec_dot_type);
-    for (int width : {704, 1408, 1536, 4096}) {
+    for (int width : {352, 704, 1408, 1536, 4096}) {
       if (width % ggml_blck_size(type) != 0) continue;
-      for (int tokens : {1, 13}) {
-        const int rows = 32, blocks = width / ggml_blck_size(type);
+      for (int tokens : {1, 2, 3, 13}) {
+        const int rows = 35, blocks = width / ggml_blck_size(type);
         const int lda = blocks + 1, ldb = blocks + 2, ldc = rows + 3;
         const size_t a_stride = lda * ggml_type_size(type);
         const size_t b_stride = ldb * ggml_type_size(traits.vec_dot_type);
@@ -155,9 +158,74 @@ int test_moe(ggml_type gate_type, ggml_type down_type, int width) {
   return failures;
 }
 
-int main() {
+int bench_iq4_nl() {
+  std::mt19937 rng(42);
+  std::normal_distribution<float> dist;
+  for (int width : {704, 1408}) {
+    const int blocks = width / QK4_NL;
+    for (int tokens : {1, 2, 8, 64, 128}) {
+      const int rows = tokens == 1 ? 32 : 256;
+      std::vector<block_iq4_nl> a(rows * blocks);
+      std::vector<block_q8_0> b(tokens * blocks);
+      std::vector<float> source(width), result(rows * tokens), reference(result.size());
+      for (int row = 0; row < rows; ++row) {
+        for (float& v : source) v = dist(rng);
+        quantize_row_iq4_nl_reference(source.data(), a.data() + row * blocks, width);
+      }
+      for (int token = 0; token < tokens; ++token) {
+        for (float& v : source) v = dist(rng);
+        quantize_row_q8_0(source.data(), b.data() + token * blocks, width);
+      }
+      // 基线直接调用原点积，不包含通用 SGEMM 分发开销。
+      auto baseline = [&] {
+        for (int j = 0; j < tokens; ++j)
+          for (int i = 0; i < rows; ++i)
+            ggml_vec_dot_iq4_nl_q8_0(width, &reference[j * rows + i], 0,
+                                    a.data() + i * blocks, 0, b.data() + j * blocks, 0, 1);
+      };
+      auto optimized = [&] {
+        llamafile_sgemm(rows, tokens, blocks, a.data(), blocks, b.data(), blocks,
+                        result.data(), rows, 0, 1, GGML_TASK_TYPE_COMPUTE,
+                        GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+      };
+      baseline();
+      optimized();
+      double error = 0, norm = 0;
+      for (size_t i = 0; i < result.size(); ++i) {
+        error += std::pow(result[i] - reference[i], 2);
+        norm += double(reference[i]) * reference[i];
+      }
+      if (!(std::sqrt(error / norm) < 2e-5)) return 1;
+      // 交替测量并取中位数，分配、量化和参考值校验均不计入耗时。
+      std::vector<double> old_times, new_times;
+      const int repeats = tokens == 1 ? 2000 : 20;
+      auto measure = [&](auto&& fn) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < repeats; ++i) fn();
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / repeats;
+      };
+      for (int round = 0; round < 7; ++round) {
+        if (round % 2) {
+          new_times.push_back(measure(optimized));
+          old_times.push_back(measure(baseline));
+        } else {
+          old_times.push_back(measure(baseline));
+          new_times.push_back(measure(optimized));
+        }
+      }
+      std::sort(old_times.begin(), old_times.end());
+      std::sort(new_times.begin(), new_times.end());
+      std::printf("IQ4_NL K=%d rows=%d tokens=%d vecdot_us=%.2f sgemm_us=%.2f ratio=%.2fx\n",
+                  width, rows, tokens, old_times[3], new_times[3], old_times[3] / new_times[3]);
+    }
+  }
+  return 0;
+}
+
+int main(int argc, char** argv) {
   ggml_context* ctx = ggml_init({0, nullptr, true});
   ggml_free(ctx);
+  if (argc == 2 && std::strcmp(argv[1], "--bench") == 0) return bench_iq4_nl();
   int failures = test_matmul();
   failures += test_moe(GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, 1408);
   failures += test_moe(GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, 1536);
