@@ -257,6 +257,25 @@ bool llamafile_sgemm_impl(long m, long n, long k, const void* A, long lda, const
 #endif
         }
 
+        case GGML_TYPE_IQ4_NL: {
+            if (Btype != GGML_TYPE_Q8_0)
+                return NOT_SUPPORTED;
+            if (task != GGML_TASK_TYPE_COMPUTE)
+                return true;
+
+            // GLM 的 1408 维 down 权重可使用 IQ4_NL，复用 GGML 的向量点积。
+            const block_iq4_nl* a = static_cast<const block_iq4_nl*>(A);
+            const block_q8_0* b = static_cast<const block_q8_0*>(B);
+            for (long job = ith; job < m * n; job += nth) {
+                const long i = job % m;
+                const long j = job / m;
+                float value = 0.0f;
+                ggml_vec_dot_iq4_nl_q8_0(k * QK4_NL, &value, 0, a + i * lda, 0, b + j * ldb, 0, 1);
+                C[j * ldc + i] = static_cast<TC>(value);
+            }
+            return true;
+        }
+
         case GGML_TYPE_MXFP4: {
             if (Btype != GGML_TYPE_Q8_0)
                 return NOT_SUPPORTED;

@@ -1764,13 +1764,29 @@ struct DequantizerQ4K final : public BaseDequantizer<block_q4_K> {
     Scales8K s8k;
 };
 
+struct IQ4Bits : Q4Bits {};
+
+template <typename Q8>
+inline void multiply_add(const IQ4Bits& bits, const __m256i * scales, int j, int i, const Q8& q8, __m256i * sumi) {
+    // IQ4 的无符号偏移值最大为 241，会使 maddubs 的 int16 结果饱和；改用有符号值。
+    for (int iy = 0; iy < Q8::nrc_y; ++iy) {
+        auto sum = _mm256_setzero_si256();
+        for (int t = 0; t < 4; ++t) {
+            auto x = bits.values[t];
+            auto y = q8.load_quants(iy, i, 4*j+t);
+            auto dot = _mm256_maddubs_epi16(_mm256_sign_epi8(x, x), _mm256_sign_epi8(y, x));
+            sum = _mm256_add_epi32(sum, _mm256_madd_epi16(scales[t], dot));
+        }
+        sumi[iy] = j == 0 ? sum : _mm256_add_epi32(sumi[iy], sum);
+    }
+}
+
 struct DequantizerIQ4XS final : public BaseDequantizer<block_iq4_xs> {
     DequantizerIQ4XS(const void * vx, size_t bx) : BaseDequantizer(vx, bx), values(load_values()) {}
     template <typename Q8>
     inline __m256i new_block(int i, const Q8& q8, __m256 * accd) {
         d = GGML_FP16_TO_FP32(x[i].d);
         auto scales128 = siq4.make_scales(*(const uint32_t *)x[i].scales_l, x[i].scales_h);
-        s8k.accum_mins(scales128, q8, i, -128.f*d, accd);
         return MM256_SET_M128I(scales128, scales128);
     }
     inline void prepare(int i, int j) {
@@ -1782,13 +1798,12 @@ struct DequantizerIQ4XS final : public BaseDequantizer<block_iq4_xs> {
     }
 
     static __m256i load_values() {
-        static const uint8_t kvalues_iq4nl[16] = {1, 24, 45, 63, 79, 93, 106, 118, 129, 141, 153, 166, 181, 197, 217, 241};
+        static const int8_t kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
         auto val128 = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
         return MM256_SET_M128I(val128, val128);
     }
 
-    Q4Bits bits;
-    Scales8K s8k;
+    IQ4Bits bits;
     ScaleIQ4XS siq4;
     const __m256i values;
 };
