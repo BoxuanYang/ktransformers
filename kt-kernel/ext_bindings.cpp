@@ -81,6 +81,7 @@ static const bool _is_plain_ = false;
 #include <type_traits>
 
 #include "fp8_layerwise_transport.hpp"
+#include "operators/dense_kvcache/dense_kvcache.h"
 #include "operators/kvcache/kvcache.h"
 #include "operators/llamafile/linear.h"
 #include "operators/llamafile/mla.hpp"
@@ -1156,6 +1157,131 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def("get_cache_total_len", &KVCache::get_cache_total_len)
       .def("update_cache_total_len",
            [](KVCache& kvcache, int cache_total_len) { kvcache.update_cache_total_len(cache_total_len); });
+
+  // BF16 dense decode attention for the GLM-4.5-Air head shape.
+  auto dense_kvcache_module = m.def_submodule("dense_kvcache");
+  py::class_<dense::KVCacheConfig>(dense_kvcache_module, "KVCacheConfig")
+      .def(py::init<int, int, int, int, int, ggml_type, int, int, int>(),
+           py::arg("layer_num"), py::arg("kv_head_num"), py::arg("q_head_num"),
+           py::arg("head_dim"), py::arg("block_len"), py::arg("kv_type"),
+           py::arg("max_block_num"), py::arg("max_batch_size"), py::arg("max_thread_num"))
+      .def_readwrite("layer_num", &dense::KVCacheConfig::layer_num)
+      .def_readwrite("kv_head_num", &dense::KVCacheConfig::kv_head_num)
+      .def_readwrite("q_head_num", &dense::KVCacheConfig::q_head_num)
+      .def_readwrite("head_dim", &dense::KVCacheConfig::head_dim)
+      .def_readwrite("block_len", &dense::KVCacheConfig::block_len)
+      .def_readwrite("kv_type", &dense::KVCacheConfig::kv_type)
+      .def_readwrite("max_block_num", &dense::KVCacheConfig::max_block_num)
+      .def_readwrite("max_batch_size", &dense::KVCacheConfig::max_batch_size)
+      .def_readwrite("max_thread_num", &dense::KVCacheConfig::max_thread_num);
+
+  py::class_<dense::KVCache>(dense_kvcache_module, "KVCache")
+      .def(py::init<dense::KVCacheConfig>())
+      .def("set_parallel_reduce", &dense::KVCache::set_parallel_reduce, py::arg("enabled"))
+      .def("get_layer_num", &dense::KVCache::get_layer_num)
+      .def("get_kv_head_num", &dense::KVCache::get_kv_head_num)
+      .def("get_q_head_num", &dense::KVCache::get_q_head_num)
+      .def("get_head_dim", &dense::KVCache::get_head_dim)
+      .def("get_block_len", &dense::KVCache::get_block_len)
+      .def("get_cache_total_len", &dense::KVCache::get_cache_total_len)
+      .def("get_cache_total_block_num", &dense::KVCache::get_cache_total_block_num)
+      .def("update_cache_total_len", &dense::KVCache::update_cache_total_len,
+           py::arg("cache_total_len"))
+      .def("get_block_num", &dense::KVCache::get_block_num)
+      .def("ThreadResize", &dense::KVCache::ThreadResize, py::arg("thread_num"))
+      .def("BatchResize", &dense::KVCache::BatchResize, py::arg("batch_size"))
+      .def("BlockResize", &dense::KVCache::BlockResize, py::arg("block_num"))
+      .def(
+          "update_kvcache_bf16",
+          [](dense::KVCache& cache, uintptr_t k, uintptr_t v, int layer, uintptr_t table,
+             int batch, int table_stride, uintptr_t lengths, int q_len, WorkerPool& pool) {
+            cache.update_kvcache_bf16(
+                reinterpret_cast<const ggml_bf16_t*>(k), reinterpret_cast<const ggml_bf16_t*>(v),
+                layer, reinterpret_cast<int*>(table), batch, table_stride,
+                reinterpret_cast<int*>(lengths), q_len, &pool);
+          },
+          py::arg("k"), py::arg("v"), py::arg("layer"), py::arg("block_table"),
+          py::arg("batch_size"), py::arg("block_table_stride"), py::arg("cache_seqlens"),
+          py::arg("q_len"), py::arg("pool"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "get_and_update_kvcache_bf16",
+          [](dense::KVCache& cache, uintptr_t k, uintptr_t v, int layer, uintptr_t table,
+             int batch, int table_stride, uintptr_t lengths, int q_len, WorkerPool& pool) {
+            cache.get_and_update_kvcache_bf16(
+                reinterpret_cast<ggml_bf16_t*>(k), reinterpret_cast<ggml_bf16_t*>(v), layer,
+                reinterpret_cast<int*>(table), batch, table_stride,
+                reinterpret_cast<int*>(lengths), q_len, &pool);
+          },
+          py::arg("k"), py::arg("v"), py::arg("layer"), py::arg("block_table"),
+          py::arg("batch_size"), py::arg("block_table_stride"), py::arg("cache_seqlens"),
+          py::arg("q_len"), py::arg("pool"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "get_kvcache_bf16",
+          [](dense::KVCache& cache, uintptr_t k, uintptr_t v, int layer, uintptr_t table,
+             int batch, int table_stride, uintptr_t lengths, WorkerPool& pool) {
+            cache.get_kvcache_bf16(
+                reinterpret_cast<ggml_bf16_t*>(k), reinterpret_cast<ggml_bf16_t*>(v), layer,
+                reinterpret_cast<int*>(table), batch, table_stride,
+                reinterpret_cast<int*>(lengths), &pool);
+          },
+          py::arg("k"), py::arg("v"), py::arg("layer"), py::arg("block_table"),
+          py::arg("batch_size"), py::arg("block_table_stride"), py::arg("cache_seqlens"),
+          py::arg("pool"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "attn",
+          [](dense::KVCache& cache, uintptr_t q, uintptr_t output, uintptr_t lse, int layer,
+             int token_idx, int q_len, int batch, int table_stride, uintptr_t table,
+             uintptr_t lengths, WorkerPool& pool) {
+            cache.attn(reinterpret_cast<const ggml_bf16_t*>(q),
+                       reinterpret_cast<ggml_bf16_t*>(output), reinterpret_cast<float*>(lse),
+                       layer, token_idx, q_len, batch, table_stride,
+                       reinterpret_cast<int*>(table), reinterpret_cast<int*>(lengths), &pool);
+          },
+          py::arg("q"), py::arg("output"), py::arg("lse"), py::arg("layer"),
+          py::arg("generate_token_idx"), py::arg("q_len"), py::arg("batch_size"),
+          py::arg("block_table_stride"), py::arg("block_table"), py::arg("cache_seqlens"),
+          py::arg("pool"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "attn_with_kvcache",
+          [](dense::KVCache& cache, uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t output,
+             uintptr_t lse, int layer, int token_idx, int q_len, int batch, int table_stride,
+             uintptr_t table, uintptr_t lengths, WorkerPool& pool) {
+            cache.attn_with_kvcache(
+                reinterpret_cast<const ggml_bf16_t*>(q), reinterpret_cast<const ggml_bf16_t*>(k),
+                reinterpret_cast<const ggml_bf16_t*>(v), reinterpret_cast<ggml_bf16_t*>(output),
+                reinterpret_cast<float*>(lse), layer, token_idx, q_len, batch, table_stride,
+                reinterpret_cast<int*>(table), reinterpret_cast<int*>(lengths), &pool);
+          },
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("output"), py::arg("lse"),
+          py::arg("layer"), py::arg("generate_token_idx"), py::arg("q_len"),
+          py::arg("batch_size"), py::arg("block_table_stride"), py::arg("block_table"),
+          py::arg("cache_seqlens"), py::arg("pool"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "clear_kvcache_all_layers",
+          [](dense::KVCache& cache, uintptr_t table, uintptr_t lengths, int batch,
+             int table_stride, WorkerPool& pool) {
+            cache.clear_kvcache_all_layers(reinterpret_cast<int*>(table),
+                                           reinterpret_cast<int*>(lengths), batch,
+                                           table_stride, &pool);
+          },
+          py::arg("block_table"), py::arg("cache_seqlens"), py::arg("batch_size"),
+          py::arg("block_table_stride"), py::arg("pool"),
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "dump_kvcache",
+          [](dense::KVCache& cache, uintptr_t table, int cache_length,
+             const std::string& path, WorkerPool& pool) {
+            cache.dump_kvcache(reinterpret_cast<int*>(table), cache_length, path, &pool);
+          },
+          py::arg("block_table"), py::arg("cache_total_len"), py::arg("path"),
+          py::arg("pool"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "load_kvcache",
+          [](dense::KVCache& cache, const std::string& path, WorkerPool& pool) {
+            cache.load_kvcache(path, &pool);
+          },
+          py::arg("path"), py::arg("pool"),
+          py::call_guard<py::gil_scoped_release>());
 
   auto utils = m.def_submodule("utils");
 

@@ -384,7 +384,7 @@ void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
 
 void NumaJobDistributor::worker_thread(int numa_id) {
   auto start = std::chrono::high_resolution_clock::now();
-  set_memory_to_numa(numa_id);
+  set_memory_to_numa(numa_ids[numa_id]);
   status[numa_id] =
       std::move(std::unique_ptr<std::atomic<ThreadStatus>>(new std::atomic<ThreadStatus>(ThreadStatus::WAITING)));
   ready_bar->arrive_and_wait();

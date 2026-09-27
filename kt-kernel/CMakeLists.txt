@@ -674,6 +674,7 @@ aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend SOURCE_DIR2)
 aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/operators/llamafile SOURCE_DIR3)
 aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llamafile SOURCE_DIR4)
 aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/operators/kvcache SOURCE_DIR5)
+aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/operators/dense_kvcache SOURCE_DIR_DENSE_KVCACHE)
 # message(STATUS "SOURCE_DIR3: ${SOURCE_DIR3}")
 
 # arm64
@@ -703,7 +704,8 @@ message(STATUS "SOURCE_DIR7: ${SOURCE_DIR7}")
 
 
 
-set(ALL_SOURCES ${SOURCE_DIR1} ${SOURCE_DIR2} ${SOURCE_DIR3} ${SOURCE_DIR4} ${SOURCE_DIR5} ${SOURCE_DIR6} ${SOURCE_DIR7})
+set(ALL_SOURCES ${SOURCE_DIR1} ${SOURCE_DIR2} ${SOURCE_DIR3} ${SOURCE_DIR4} ${SOURCE_DIR5}
+                ${SOURCE_DIR_DENSE_KVCACHE} ${SOURCE_DIR6} ${SOURCE_DIR7})
 
 file(GLOB_RECURSE FMT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
