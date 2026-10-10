@@ -832,7 +832,12 @@ class BaseMoEWrapper(_MoEBase, ABC):
         output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
         return output_gpu[current_slot]
 
-    def sync_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
+    def sync_forward(
+        self,
+        hidden_states: torch.Tensor,
+        cuda_stream,
+        kv_scatter_plans: Optional[List[List[int]]] = None,
+    ) -> torch.Tensor:
         """
         Synchronize and retrieve forward inference results.
 
@@ -874,7 +879,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 _wait_device(hidden_states.device)
                 self.cpu_infer.sync(allow_pending)
             else:
-                self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+                self.cpu_infer.sync_with_cuda_stream(
+                    cuda_stream, allow_pending, kv_scatter_plans or []
+                )
 
         return self.copy_forward_output_to_device(hidden_states)
 

@@ -655,7 +655,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("backend_", &CPUInfer::backend_)
 #ifndef KTRANSFORMERS_CPU_ONLY
       .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream, py::arg("user_cuda_stream"),
-           py::arg("allow_n_pending") = 0)
+           py::arg("allow_n_pending") = 0,
+           py::arg("kv_scatter_plans") = std::vector<std::vector<uintptr_t>>{})
       .def("submit_with_cuda_stream", &CPUInfer::submit_with_cuda_stream)
 #endif
       ;

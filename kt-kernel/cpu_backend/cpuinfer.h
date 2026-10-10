@@ -12,10 +12,15 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
 #include "vendors/cuda.h"
@@ -37,6 +42,23 @@
 
 class CPUInfer {
  public:
+  struct KVScatterPlan {
+    std::byte* k_dst;
+    std::byte* v_dst;
+    const std::byte* src;
+    const int32_t* indices;
+    size_t count;
+    size_t row_bytes;
+    size_t capacity;
+  };
+
+  struct SyncArgs {
+    CPUInfer* cpuinfer;
+    size_t allow_n_pending;
+    std::vector<KVScatterPlan> kv_scatter_plans;
+    bool delete_after_run;
+  };
+
   CPUInfer(int thread_num) {
     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
     backend_ = new WorkerPool(thread_num);
@@ -65,6 +87,9 @@ class CPUInfer {
 
   ~CPUInfer() {
     printf("CPUInfer[0x%lx]: Goodbye\n", (intptr_t)this);
+    for (SyncArgs* args : captured_sync_args_) {
+      delete args;
+    }
     delete backend_;
     delete task_queue_;
   }
@@ -98,33 +123,85 @@ class CPUInfer {
   }
 #endif
 
-  struct SyncArgs {
-    CPUInfer* cpuinfer;
-    size_t allow_n_pending;
-  };
-
   static void sync_(void* sync_args) {
     SyncArgs* args = (SyncArgs*)sync_args;
+    // The KV D2H is ordered before this already-required KT sync callback.
+    // Scatter first so its tiny CPU copy overlaps any remaining CPU MoE work,
+    // then perform the original queue drain.  This adds no CUDA host node.
+    for (const KVScatterPlan& plan : args->kv_scatter_plans) {
+      const size_t src_stride = 2 * plan.row_bytes;
+      for (size_t i = 0; i < plan.count; ++i) {
+        const int64_t index = plan.indices[i];
+        if (index < 0 || static_cast<size_t>(index) >= plan.capacity) {
+          continue;
+        }
+        const std::byte* row = plan.src + i * src_stride;
+        std::memcpy(plan.k_dst + index * plan.row_bytes, row, plan.row_bytes);
+        std::memcpy(plan.v_dst + index * plan.row_bytes, row + plan.row_bytes, plan.row_bytes);
+      }
+    }
     args->cpuinfer->task_queue_->sync(args->allow_n_pending);
+    if (args->delete_after_run) {
+      delete args;
+    }
   }
 
   void sync(size_t allow_n_pending = 0) {
-    SyncArgs* args = new SyncArgs{this, allow_n_pending};
-    sync_(args);
+    SyncArgs args{this, allow_n_pending, {}, false};
+    sync_(&args);
   }
 #ifndef KTRANSFORMERS_CPU_ONLY
-  void sync_with_cuda_stream(intptr_t user_cuda_stream, size_t allow_n_pending = 0) {
+  void sync_with_cuda_stream(intptr_t user_cuda_stream, size_t allow_n_pending = 0,
+                             const std::vector<std::vector<uintptr_t>>& raw_kv_scatter_plans = {}) {
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS) || \
     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA) || \
     defined(KTRANSFORMERS_USE_ASCEND_NPU)
-    SyncArgs* args = new SyncArgs{this, allow_n_pending};
-    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)args);
+    std::vector<KVScatterPlan> kv_scatter_plans;
+    kv_scatter_plans.reserve(raw_kv_scatter_plans.size());
+    for (const auto& raw : raw_kv_scatter_plans) {
+      if (raw.size() != 7 || !raw[0] || !raw[1] || !raw[2] || !raw[3] || !raw[4] || !raw[5] ||
+          !raw[6]) {
+        throw std::invalid_argument("KV scatter plan must contain 7 valid pointer/size values");
+      }
+      kv_scatter_plans.push_back(KVScatterPlan{
+          reinterpret_cast<std::byte*>(raw[0]),
+          reinterpret_cast<std::byte*>(raw[1]),
+          reinterpret_cast<const std::byte*>(raw[2]),
+          reinterpret_cast<const int32_t*>(raw[3]),
+          static_cast<size_t>(raw[4]),
+          static_cast<size_t>(raw[5]),
+          static_cast<size_t>(raw[6]),
+      });
+    }
+
+    auto* stream = reinterpret_cast<cudaStream_t>(user_cuda_stream);
+    bool captured = false;
+#if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess) {
+      captured = capture_status != cudaStreamCaptureStatusNone;
+    }
+#endif
+    SyncArgs* args = new SyncArgs{this, allow_n_pending, std::move(kv_scatter_plans), !captured};
+    cudaError_t status = cudaLaunchHostFunc(stream, (cudaHostFn_t)&sync_, (void*)args);
+    if (status != cudaSuccess) {
+      delete args;
+      throw std::runtime_error(cudaGetErrorString(status));
+    }
+    if (captured) {
+      std::lock_guard<std::mutex> lock(captured_sync_args_mutex_);
+      captured_sync_args_.push_back(args);
+    }
 #endif
   }
 #endif
  public:
   WorkerPool* backend_;
   TaskQueue* task_queue_;
+
+ private:
+  std::mutex captured_sync_args_mutex_;
+  std::vector<SyncArgs*> captured_sync_args_;
 };
 
 #endif
