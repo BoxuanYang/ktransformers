@@ -921,6 +921,30 @@ endif()
 
 if(KTRANSFORMERS_USE_CUDA)
     add_compile_definitions(USE_CUDA=1)
+
+    # Conda's split CUDA packages may install NVTX headers in the Python
+    # package instead of CUDAToolkit_INCLUDE_DIRS.  Locate that header-only
+    # dependency explicitly so CPUInfer's host-callback ranges build without
+    # requiring users to add a compiler -I flag by hand.
+    set(_KT_NVTX_INCLUDE_HINTS ${CUDAToolkit_INCLUDE_DIRS})
+    if(DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}")
+        list(APPEND _KT_NVTX_INCLUDE_HINTS "$ENV{CONDA_PREFIX}/include")
+        file(GLOB _KT_CONDA_NVTX_INCLUDE_HINTS
+            "$ENV{CONDA_PREFIX}/lib/python*/site-packages/nvidia/nvtx/include"
+            "$ENV{CONDA_PREFIX}/nsight-compute-*/host/target-linux-x64/nvtx/include"
+        )
+        list(APPEND _KT_NVTX_INCLUDE_HINTS ${_KT_CONDA_NVTX_INCLUDE_HINTS})
+    endif()
+    find_path(KTRANSFORMERS_NVTX_INCLUDE_DIR
+        NAMES nvtx3/nvToolsExt.h
+        HINTS ${_KT_NVTX_INCLUDE_HINTS}
+    )
+    if(NOT KTRANSFORMERS_NVTX_INCLUDE_DIR)
+        message(FATAL_ERROR "NVTX3 header not found (expected nvtx3/nvToolsExt.h)")
+    endif()
+    target_include_directories(${PROJECT_NAME} PRIVATE ${KTRANSFORMERS_NVTX_INCLUDE_DIR})
+    message(STATUS "NVTX3 include: ${KTRANSFORMERS_NVTX_INCLUDE_DIR}")
+
     # Link CUDA runtime (static or dynamic)
     if(KTRANSFORMERS_CUDA_STATIC_RUNTIME)
         # Platform-aware static library path
