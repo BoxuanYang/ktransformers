@@ -40,6 +40,10 @@
 #include "task_queue.h"
 #include "worker_pool.h"
 
+#if defined(KTRANSFORMERS_USE_CUDA)
+#include <nvtx3/nvToolsExt.h>
+#endif
+
 class CPUInfer {
  public:
   struct KVScatterPlan {
@@ -128,17 +132,25 @@ class CPUInfer {
     // The KV D2H is ordered before this already-required KT sync callback.
     // Scatter first so its tiny CPU copy overlaps any remaining CPU MoE work,
     // then perform the original queue drain.  This adds no CUDA host node.
-    for (const KVScatterPlan& plan : args->kv_scatter_plans) {
-      const size_t src_stride = 2 * plan.row_bytes;
-      for (size_t i = 0; i < plan.count; ++i) {
-        const int64_t index = plan.indices[i];
-        if (index < 0 || static_cast<size_t>(index) >= plan.capacity) {
-          continue;
+    if (!args->kv_scatter_plans.empty()) {
+#if defined(KTRANSFORMERS_USE_CUDA)
+      nvtxRangePushA("KVShadow/Decode_CPU_Scatter");
+#endif
+      for (const KVScatterPlan& plan : args->kv_scatter_plans) {
+        const size_t src_stride = 2 * plan.row_bytes;
+        for (size_t i = 0; i < plan.count; ++i) {
+          const int64_t index = plan.indices[i];
+          if (index < 0 || static_cast<size_t>(index) >= plan.capacity) {
+            continue;
+          }
+          const std::byte* row = plan.src + i * src_stride;
+          std::memcpy(plan.k_dst + index * plan.row_bytes, row, plan.row_bytes);
+          std::memcpy(plan.v_dst + index * plan.row_bytes, row + plan.row_bytes, plan.row_bytes);
         }
-        const std::byte* row = plan.src + i * src_stride;
-        std::memcpy(plan.k_dst + index * plan.row_bytes, row, plan.row_bytes);
-        std::memcpy(plan.v_dst + index * plan.row_bytes, row + plan.row_bytes, plan.row_bytes);
       }
+#if defined(KTRANSFORMERS_USE_CUDA)
+      nvtxRangePop();
+#endif
     }
     args->cpuinfer->task_queue_->sync(args->allow_n_pending);
     if (args->delete_after_run) {
