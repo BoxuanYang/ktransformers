@@ -54,6 +54,7 @@ class CPUInfer {
     size_t count;
     size_t row_bytes;
     size_t capacity;
+    bool is_prefill;
   };
 
   struct SyncArgs {
@@ -130,11 +131,13 @@ class CPUInfer {
   static void sync_(void* sync_args) {
     SyncArgs* args = (SyncArgs*)sync_args;
     // The KV D2H is ordered before this already-required KT sync callback.
-    // Scatter first so its tiny CPU copy overlaps any remaining CPU MoE work,
-    // then perform the original queue drain.  This adds no CUDA host node.
+    // Scatter first so its CPU copy overlaps any remaining CPU MoE work, then
+    // perform the original queue drain. Prefill and decode share this path, so
+    // KV shadowing adds no CUDA host node in either phase.
     if (!args->kv_scatter_plans.empty()) {
 #if defined(KTRANSFORMERS_USE_CUDA)
-      nvtxRangePushA("KVShadow/Decode_CPU_Scatter");
+      nvtxRangePushA(args->kv_scatter_plans.front().is_prefill ? "KVShadow/Prefill_CPU_Scatter"
+                                                               : "KVShadow/Decode_CPU_Scatter");
 #endif
       for (const KVScatterPlan& plan : args->kv_scatter_plans) {
         const size_t src_stride = 2 * plan.row_bytes;
@@ -171,9 +174,9 @@ class CPUInfer {
     std::vector<KVScatterPlan> kv_scatter_plans;
     kv_scatter_plans.reserve(raw_kv_scatter_plans.size());
     for (const auto& raw : raw_kv_scatter_plans) {
-      if (raw.size() != 7 || !raw[0] || !raw[1] || !raw[2] || !raw[3] || !raw[4] || !raw[5] ||
+      if (raw.size() != 8 || !raw[0] || !raw[1] || !raw[2] || !raw[3] || !raw[4] || !raw[5] ||
           !raw[6]) {
-        throw std::invalid_argument("KV scatter plan must contain 7 valid pointer/size values");
+        throw std::invalid_argument("KV scatter plan must contain 7 pointer/size values and a phase flag");
       }
       kv_scatter_plans.push_back(KVScatterPlan{
           reinterpret_cast<std::byte*>(raw[0]),
@@ -183,6 +186,7 @@ class CPUInfer {
           static_cast<size_t>(raw[4]),
           static_cast<size_t>(raw[5]),
           static_cast<size_t>(raw[6]),
+          raw[7] != 0,
       });
     }
 
