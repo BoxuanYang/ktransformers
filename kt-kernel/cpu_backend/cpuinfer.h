@@ -47,13 +47,13 @@
 class CPUInfer {
  public:
   struct KVScatterPlan {
-    std::byte* k_dst;
-    std::byte* v_dst;
+    std::byte* kv_dst;
     const std::byte* src;
     const int32_t* indices;
     size_t count;
     size_t row_bytes;
     size_t capacity;
+    size_t page_size;
     bool is_prefill;
   };
 
@@ -147,8 +147,13 @@ class CPUInfer {
             continue;
           }
           const std::byte* row = plan.src + i * src_stride;
-          std::memcpy(plan.k_dst + index * plan.row_bytes, row, plan.row_bytes);
-          std::memcpy(plan.v_dst + index * plan.row_bytes, row + plan.row_bytes, plan.row_bytes);
+          const size_t page = static_cast<size_t>(index) / plan.page_size;
+          const size_t offset = static_cast<size_t>(index) % plan.page_size;
+          const size_t page_stride = 2 * plan.page_size * plan.row_bytes;
+          std::byte* page_base = plan.kv_dst + page * page_stride;
+          std::memcpy(page_base + offset * plan.row_bytes, row, plan.row_bytes);
+          std::memcpy(page_base + (plan.page_size + offset) * plan.row_bytes,
+                      row + plan.row_bytes, plan.row_bytes);
         }
       }
 #if defined(KTRANSFORMERS_USE_CUDA)
