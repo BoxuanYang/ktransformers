@@ -224,6 +224,8 @@ class KExpertsCPUBuffer:
     capture_buffers: Dict = dict()
     temp_bs: int = 0
     temp_buffer: tuple = tuple()
+    previous_temp_buffer: tuple = tuple()
+    external_h2d: bool = False
     buffer_depth: int = 2
 
     @classmethod
@@ -237,6 +239,11 @@ class KExpertsCPUBuffer:
             return cls.capture_buffers[batch_size]
         if batch_size == cls.temp_bs:
             return cls.temp_buffer
+
+        # The scheduler overlaps at most one previous batch. Keep that batch's
+        # pinned buffers alive because native H2D stores raw pointers to them.
+        if cls.external_h2d:
+            cls.previous_temp_buffer = cls.temp_buffer
 
         input_tensor_cpu = [
             torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
@@ -456,9 +463,16 @@ class BaseMoEWrapper(_MoEBase, ABC):
 
         # Initialize CPU inference engine (singleton via shared base class)
         self.cpu_infer = self._get_cpu_infer(cpuinfer_threads, threadpool_count, numa_nodes=numa_nodes)
+        self.io_manager = None
 
         # Backend-specific initialization happens in subclasses
         self.moe = None
+
+    def set_io_manager(self, io_manager) -> None:
+        """Attach the shared native H2D executor used by serving inference."""
+        self.io_manager = io_manager
+        if io_manager is not None:
+            KExpertsCPUBuffer.external_h2d = True
 
     @abstractmethod
     def load_weights_from_tensors(
@@ -816,7 +830,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
-    def copy_forward_output_to_device(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def copy_forward_output_to_device(
+        self, hidden_states: torch.Tensor, *, copy: bool = True
+    ) -> torch.Tensor:
         """Copy pinned CPU output to the device tensor (CPU work already finished)."""
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         (
@@ -829,7 +845,8 @@ class BaseMoEWrapper(_MoEBase, ABC):
             output_gpu,
         ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
-        output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
+        if copy:
+            output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
         return output_gpu[current_slot]
 
     def sync_forward(
@@ -862,8 +879,32 @@ class BaseMoEWrapper(_MoEBase, ABC):
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
         bypass = _should_bypass_stream_callback(hidden_states.device)
+        src = output_cpu[current_slot]
+        dst = output_gpu[current_slot]
+        use_io_manager = (
+            self.io_manager is not None
+            and hidden_states.device.type == "cuda"
+            and src.is_pinned()
+            and src.is_contiguous()
+            and dst.is_contiguous()
+            and src.dtype == dst.dtype
+            and src.numel() == dst.numel()
+        )
+        moe_h2d_plan = []
+        if use_io_manager:
+            moe_h2d_plan = [
+                int(self.io_manager.native_handle),
+                src.data_ptr(),
+                dst.data_ptr(),
+                dst.numel() * dst.element_size(),
+            ]
         if bypass:
             self.cpu_infer.sync(allow_pending)
+            if use_io_manager:
+                task_id = self.io_manager.submit_moe_h2d(
+                    moe_h2d_plan[1], moe_h2d_plan[2], moe_h2d_plan[3]
+                )
+                self.io_manager.sync_moe_h2d(task_id)
         else:
             if (
                 hidden_states.device.type == "npu"
@@ -880,10 +921,13 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 self.cpu_infer.sync(allow_pending)
             else:
                 self.cpu_infer.sync_with_cuda_stream(
-                    cuda_stream, allow_pending, kv_scatter_plans or []
+                    cuda_stream,
+                    allow_pending,
+                    kv_scatter_plans or [],
+                    moe_h2d_plan,
                 )
 
-        return self.copy_forward_output_to_device(hidden_states)
+        return self.copy_forward_output_to_device(hidden_states, copy=not use_io_manager)
 
     def forward(
         self,
@@ -944,4 +988,5 @@ class BaseMoEWrapper(_MoEBase, ABC):
         KExpertsCPUBuffer.capture_buffers.clear()
         KExpertsCPUBuffer.temp_bs = 0
         KExpertsCPUBuffer.temp_buffer = tuple()
+        KExpertsCPUBuffer.previous_temp_buffer = tuple()
 

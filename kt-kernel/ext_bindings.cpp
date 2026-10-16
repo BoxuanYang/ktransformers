@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstring>
 
+#include "cpu_backend/backend_io_manager.h"
 #include "cpu_backend/cpuinfer.h"
 #include "cpu_backend/worker_pool.h"
 #if defined(KTRANSFORMERS_USE_ASCEND_NPU)
@@ -641,6 +642,24 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
         "True iff the ACL callback worker is started and dispatching reports.");
 #endif
   py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
+  py::class_<BackendIOManager>(m, "BackendIOManager")
+      .def(py::init<int>(), py::arg("device_id"))
+      .def("submit_kv_fetch", &BackendIOManager::submit_kv_fetch, py::arg("src"), py::arg("dst"),
+           py::arg("nbytes"), py::arg("group_id"), py::arg("completion_tag") = 0,
+           py::arg("ready_flag") = 0)
+      .def("submit_moe_h2d", &BackendIOManager::submit_moe_h2d, py::arg("src"), py::arg("dst"),
+           py::arg("nbytes"))
+      .def("sync_moe_h2d", &BackendIOManager::sync_moe_h2d, py::arg("task_id"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("cancel_kv", &BackendIOManager::cancel_kv, py::arg("group_id"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("take_completed_kv", &BackendIOManager::take_completed_kv)
+      .def("sync_kv", &BackendIOManager::sync_kv, py::arg("group_id"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("pause_kv", &BackendIOManager::pause_kv, py::call_guard<py::gil_scoped_release>())
+      .def("resume_kv", &BackendIOManager::resume_kv)
+      .def("close", &BackendIOManager::close, py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly("native_handle", &BackendIOManager::native_handle);
   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
       .def(py::init<>())
       .def_readwrite("subpool_count", &WorkerPoolConfig::subpool_count)
@@ -656,7 +675,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 #ifndef KTRANSFORMERS_CPU_ONLY
       .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream, py::arg("user_cuda_stream"),
            py::arg("allow_n_pending") = 0,
-           py::arg("kv_scatter_plans") = std::vector<std::vector<uintptr_t>>{})
+           py::arg("kv_scatter_plans") = std::vector<std::vector<uintptr_t>>{},
+           py::arg("moe_h2d_plan") = std::vector<uintptr_t>{})
       .def("submit_with_cuda_stream", &CPUInfer::submit_with_cuda_stream)
 #endif
       ;

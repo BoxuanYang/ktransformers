@@ -36,6 +36,7 @@
 #endif
 
 #include "./vendors/vendor.h"
+#include "backend_io_manager.h"
 #include "llama.cpp/ggml-impl.h"
 #include "task_queue.h"
 #include "worker_pool.h"
@@ -61,6 +62,10 @@ class CPUInfer {
     CPUInfer* cpuinfer;
     size_t allow_n_pending;
     std::vector<KVScatterPlan> kv_scatter_plans;
+    BackendIOManager* io_manager;
+    const std::byte* moe_src;
+    std::byte* moe_dst;
+    size_t moe_nbytes;
     bool delete_after_run;
   };
 
@@ -161,18 +166,30 @@ class CPUInfer {
 #endif
     }
     args->cpuinfer->task_queue_->sync(args->allow_n_pending);
+    // output_cpu becomes valid only after the CPU task queue has drained.  Put
+    // the activation H2D on the shared priority executor here, inside KT's
+    // existing sync host callback, so CUDA Graph replay does not need any
+    // additional host nodes.
+    if (args->io_manager != nullptr && args->moe_src != nullptr && args->moe_dst != nullptr &&
+        args->moe_nbytes != 0) {
+      const std::uint64_t task_id = args->io_manager->submit_moe_h2d(
+          reinterpret_cast<std::uintptr_t>(args->moe_src), reinterpret_cast<std::uintptr_t>(args->moe_dst),
+          args->moe_nbytes);
+      args->io_manager->sync_moe_h2d(task_id);
+    }
     if (args->delete_after_run) {
       delete args;
     }
   }
 
   void sync(size_t allow_n_pending = 0) {
-    SyncArgs args{this, allow_n_pending, {}, false};
+    SyncArgs args{this, allow_n_pending, {}, nullptr, nullptr, nullptr, 0, false};
     sync_(&args);
   }
 #ifndef KTRANSFORMERS_CPU_ONLY
   void sync_with_cuda_stream(intptr_t user_cuda_stream, size_t allow_n_pending = 0,
-                             const std::vector<std::vector<uintptr_t>>& raw_kv_scatter_plans = {}) {
+                             const std::vector<std::vector<uintptr_t>>& raw_kv_scatter_plans = {},
+                             const std::vector<uintptr_t>& raw_moe_h2d_plan = {}) {
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS) || \
     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA) || \
     defined(KTRANSFORMERS_USE_ASCEND_NPU)
@@ -185,14 +202,29 @@ class CPUInfer {
       }
       kv_scatter_plans.push_back(KVScatterPlan{
           reinterpret_cast<std::byte*>(raw[0]),
-          reinterpret_cast<std::byte*>(raw[1]),
-          reinterpret_cast<const std::byte*>(raw[2]),
-          reinterpret_cast<const int32_t*>(raw[3]),
+          reinterpret_cast<const std::byte*>(raw[1]),
+          reinterpret_cast<const int32_t*>(raw[2]),
+          static_cast<size_t>(raw[3]),
           static_cast<size_t>(raw[4]),
           static_cast<size_t>(raw[5]),
           static_cast<size_t>(raw[6]),
           raw[7] != 0,
       });
+    }
+
+    BackendIOManager* io_manager = nullptr;
+    const std::byte* moe_src = nullptr;
+    std::byte* moe_dst = nullptr;
+    size_t moe_nbytes = 0;
+    if (!raw_moe_h2d_plan.empty()) {
+      if (raw_moe_h2d_plan.size() != 4 || !raw_moe_h2d_plan[0] || !raw_moe_h2d_plan[1] ||
+          !raw_moe_h2d_plan[2] || !raw_moe_h2d_plan[3]) {
+        throw std::invalid_argument("MoE H2D plan must contain manager, source, destination and byte count");
+      }
+      io_manager = reinterpret_cast<BackendIOManager*>(raw_moe_h2d_plan[0]);
+      moe_src = reinterpret_cast<const std::byte*>(raw_moe_h2d_plan[1]);
+      moe_dst = reinterpret_cast<std::byte*>(raw_moe_h2d_plan[2]);
+      moe_nbytes = static_cast<size_t>(raw_moe_h2d_plan[3]);
     }
 
     auto* stream = reinterpret_cast<cudaStream_t>(user_cuda_stream);
@@ -203,7 +235,8 @@ class CPUInfer {
       captured = capture_status != cudaStreamCaptureStatusNone;
     }
 #endif
-    SyncArgs* args = new SyncArgs{this, allow_n_pending, std::move(kv_scatter_plans), !captured};
+    SyncArgs* args = new SyncArgs{this, allow_n_pending, std::move(kv_scatter_plans), io_manager,
+                                  moe_src, moe_dst, moe_nbytes, !captured};
     cudaError_t status = cudaLaunchHostFunc(stream, (cudaHostFn_t)&sync_, (void*)args);
     if (status != cudaSuccess) {
       delete args;
